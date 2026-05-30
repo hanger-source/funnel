@@ -3,12 +3,22 @@ package main
 import (
 	"fmt"
 	"os"
+	"path/filepath"
+	"syscall"
 
 	"github.com/getlantern/systray"
 )
 
+var instanceLock *os.File
+
 func main() {
 	initLogger()
+	if err := acquireInstanceLock(); err != nil {
+		logError("another Funnel instance is already running: %v", err)
+		return
+	}
+	defer instanceLock.Close()
+
 	logInfo("funnel starting")
 	defer func() {
 		if r := recover(); r != nil {
@@ -16,6 +26,20 @@ func main() {
 		}
 	}()
 	systray.Run(onReady, onExit)
+}
+
+func acquireInstanceLock() error {
+	lockPath := filepath.Join(ConfigDir(), "funnel.lock")
+	f, err := os.OpenFile(lockPath, os.O_CREATE|os.O_RDWR, 0644)
+	if err != nil {
+		return err
+	}
+	if err := syscall.Flock(int(f.Fd()), syscall.LOCK_EX|syscall.LOCK_NB); err != nil {
+		f.Close()
+		return err
+	}
+	instanceLock = f
+	return nil
 }
 
 func onReady() {

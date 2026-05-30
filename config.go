@@ -16,9 +16,9 @@ type UpstreamProxy struct {
 // NodeConfig defines a direct proxy node (vmess/shadowsocks)
 type NodeConfig struct {
 	Name     string `json:"name"`
-	Type     string `json:"type"`     // "vmess" or "shadowsocks"
-	Server   string `json:"server"`   // server address
-	Port     int    `json:"port"`     // server port
+	Type     string `json:"type"`   // "vmess" or "shadowsocks"
+	Server   string `json:"server"` // server address
+	Port     int    `json:"port"`   // server port
 	UUID     string `json:"uuid,omitempty"`
 	Security string `json:"security,omitempty"`
 	Method   string `json:"method,omitempty"`
@@ -40,6 +40,17 @@ type Config struct {
 	// TargetDomains lists domain suffixes to proxy (in addition to process matching).
 	// Traffic to these domains will be proxied regardless of which process sends it.
 	TargetDomains []string `json:"target_domains,omitempty"`
+
+	// RouteAddresses lists optional IP ranges that should be forced into the TUN.
+	// These are appended to the DNS and FakeIP routes managed by Funnel.
+	RouteAddresses []string `json:"route_addresses,omitempty"`
+
+	// DirectDNS is used by sing-box for non-target DNS after DNS hijack.
+	DirectDNS string `json:"direct_dns,omitempty"`
+
+	// FakeIPRange is returned for target A queries. Target AAAA queries get
+	// an empty success response because the current TUN setup is IPv4 FakeIP only.
+	FakeIPRange string `json:"fake_ip_range,omitempty"`
 
 	// LogLevel for sing-box: trace/debug/info/warn/error
 	LogLevel string `json:"log_level,omitempty"`
@@ -77,6 +88,13 @@ var DefaultTargetDomains = []string{
 	"oaiusercontent.com",
 }
 
+var DefaultRouteAddresses []string
+
+const (
+	DefaultDirectDNS   = "223.5.5.5"
+	DefaultFakeIPRange = "198.18.0.0/15"
+)
+
 func ConfigDir() string {
 	home, _ := os.UserHomeDir()
 	dir := filepath.Join(home, ".funnel")
@@ -102,6 +120,9 @@ func LoadConfig() (*Config, error) {
 		}
 		c.TargetProcesses = DefaultTargetProcesses
 		c.TargetDomains = DefaultTargetDomains
+		c.RouteAddresses = DefaultRouteAddresses
+		c.DirectDNS = DefaultDirectDNS
+		c.FakeIPRange = DefaultFakeIPRange
 		c.Save()
 		return c, nil
 	}
@@ -110,6 +131,12 @@ func LoadConfig() (*Config, error) {
 	}
 	if c.LogLevel == "" {
 		c.LogLevel = "info"
+	}
+	if c.DirectDNS == "" {
+		c.DirectDNS = DefaultDirectDNS
+	}
+	if c.FakeIPRange == "" {
+		c.FakeIPRange = DefaultFakeIPRange
 	}
 	return c, nil
 }
@@ -134,6 +161,13 @@ func (c *Config) GetTargetDomains() []string {
 		return c.TargetDomains
 	}
 	return DefaultTargetDomains
+}
+
+func (c *Config) GetRouteAddresses() []string {
+	if len(c.RouteAddresses) > 0 {
+		return c.RouteAddresses
+	}
+	return DefaultRouteAddresses
 }
 
 func (c *Config) HasUpstream() bool {

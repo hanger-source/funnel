@@ -8,6 +8,7 @@ import (
 	"os/exec"
 	"os/signal"
 	"strings"
+	"sync"
 	"syscall"
 	"time"
 )
@@ -26,7 +27,11 @@ type Response struct {
 	Message string `json:"message,omitempty"`
 }
 
-var singboxCmd *exec.Cmd
+var (
+	singboxMu   sync.Mutex
+	singboxCmd  *exec.Cmd
+	singboxDone chan error
+)
 
 func main() {
 	// Raise fd limit for sing-box TUN
@@ -100,12 +105,14 @@ func handleConn(conn net.Conn) {
 		sendResponse(conn, true, "stopped")
 
 	case "status":
+		singboxMu.Lock()
 		running := singboxCmd != nil && singboxCmd.Process != nil
 		if running {
 			if err := singboxCmd.Process.Signal(syscall.Signal(0)); err != nil {
 				running = false
 			}
 		}
+		singboxMu.Unlock()
 		if running {
 			sendResponse(conn, true, "running")
 		} else {
@@ -118,7 +125,13 @@ func handleConn(conn net.Conn) {
 }
 
 func startSingBox(binary, config, logPath string) error {
+	singboxMu.Lock()
+	defer singboxMu.Unlock()
+
+	stopSingBoxLocked()
+
 	singboxCmd = exec.Command(binary, "run", "-c", config)
+	singboxDone = make(chan error, 1)
 
 	if logPath != "" {
 		f, err := os.OpenFile(logPath, os.O_CREATE|os.O_WRONLY|os.O_APPEND, 0666)
@@ -130,33 +143,39 @@ func startSingBox(binary, config, logPath string) error {
 	}
 
 	if err := singboxCmd.Start(); err != nil {
+		singboxCmd = nil
+		singboxDone = nil
 		return fmt.Errorf("start failed: %v", err)
 	}
 
+	cmd := singboxCmd
+	done := singboxDone
 	go func() {
-		singboxCmd.Wait()
+		done <- cmd.Wait()
 	}()
 
 	return nil
 }
 
 func stopSingBox() {
+	singboxMu.Lock()
+	defer singboxMu.Unlock()
+	stopSingBoxLocked()
+}
+
+func stopSingBoxLocked() {
 	if singboxCmd != nil && singboxCmd.Process != nil {
 		singboxCmd.Process.Signal(syscall.SIGTERM)
-		done := make(chan struct{})
-		go func() {
-			singboxCmd.Wait()
-			close(done)
-		}()
 		select {
-		case <-done:
+		case <-singboxDone:
 		case <-time.After(3 * time.Second):
 			singboxCmd.Process.Kill()
-			<-done
+			<-singboxDone
 		}
 		singboxCmd = nil
+		singboxDone = nil
 	}
-	// Also kill any orphaned sing-box
+	// Clean up any old child left by a previous helper instance.
 	exec.Command("pkill", "-f", "sing-box.*funnel").Run()
 }
 

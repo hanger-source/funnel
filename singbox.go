@@ -2,7 +2,6 @@ package main
 
 import (
 	"bufio"
-	"fmt"
 	"net"
 	"os"
 	"strings"
@@ -89,12 +88,13 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 	}
 
 	// Route rules:
-	// 1. Private IPs -> direct
+	// 1. DNS packets -> internal DNS
 	// 2. Target domains -> proxy (regardless of process)
 	// 3. Target processes -> proxy
-	// 4. Everything else -> direct
+	// 4. Private IPs -> direct
+	// 5. Everything else -> direct
 	routeRules := []map[string]interface{}{
-		{"ip_is_private": true, "outbound": "direct"},
+		{"protocol": "dns", "action": "hijack-dns"},
 	}
 
 	if len(targetDomains) > 0 {
@@ -111,23 +111,47 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 		})
 	}
 
-	// DNS rules:
-	// - Target domains use remote DNS (via proxy)
-	// - Target processes use remote DNS (via proxy)
-	// - Everything else uses system DNS
-	systemDNS := detectSystemDNS()
-	logInfo("system DNS: %s", systemDNS)
+	routeRules = append(routeRules, map[string]interface{}{
+		"ip_is_private": true,
+		"outbound":      "direct",
+	})
 
-	dnsRules := []map[string]interface{}{
-		{"outbound": "any", "server": "dns-direct"},
-	}
+	systemDNSList := detectSystemDNSList()
+	logInfo("system DNS: %v", systemDNSList)
+	logInfo("direct DNS: %s", cfg.DirectDNS)
+	logInfo("fake IP range: %s", cfg.FakeIPRange)
+
+	dnsRules := []map[string]interface{}{}
+	// sing-box 1.11 legacy fakeip needs an IPv6 range for AAAA fake responses.
+	// Funnel only routes IPv4 FakeIP today, so target AAAA returns NOERROR/NODATA
+	// and target A carries the stable FakeIP path.
 	if len(targetDomains) > 0 {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"domain_suffix": targetDomains,
+			"query_type":    []string{"AAAA"},
+			"server":        "dns-empty",
+		})
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"domain_suffix": targetDomains,
+			"query_type":    []string{"A"},
+			"server":        "dns-fake",
+		})
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"domain_suffix": targetDomains,
 			"server":        "dns-remote",
 		})
 	}
 	if len(targetProcesses) > 0 {
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"process_name": targetProcesses,
+			"query_type":   []string{"AAAA"},
+			"server":       "dns-empty",
+		})
+		dnsRules = append(dnsRules, map[string]interface{}{
+			"process_name": targetProcesses,
+			"query_type":   []string{"A"},
+			"server":       "dns-fake",
+		})
 		dnsRules = append(dnsRules, map[string]interface{}{
 			"process_name": targetProcesses,
 			"server":       "dns-remote",
@@ -143,22 +167,24 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 	// TUN inbound
 	var excludeAddrs []string
 	excludeAddrs = append(excludeAddrs, excludeIPs...)
-	if systemDNS != "" && systemDNS != "127.0.0.1" {
-		excludeAddrs = append(excludeAddrs, systemDNS+"/32")
-		logInfo("excluding system DNS from TUN: %s", systemDNS)
-	}
 	logInfo("route_exclude_address: %v", excludeAddrs)
 
+	routeAddrs := mergeRouteAddresses(cfg.GetRouteAddresses(), []string{cfg.FakeIPRange}, cidrHostAddrs(systemDNSList))
+	logInfo("route_address: %v", routeAddrs)
+
 	tunInbound := map[string]interface{}{
-		"type":                        "tun",
-		"tag":                         "tun-in",
-		"address":                     []string{"172.19.0.1/28"},
-		"auto_route":                  true,
-		"strict_route":                true,
-		"stack":                       "gvisor",
-		"sniff":                       true,
-		"sniff_override_destination":  true,
-		"route_exclude_address":       excludeAddrs,
+		"type":                       "tun",
+		"tag":                        "tun-in",
+		"address":                    []string{"172.19.0.1/28"},
+		"auto_route":                 true,
+		"strict_route":               true,
+		"stack":                      "gvisor",
+		"sniff":                      true,
+		"sniff_override_destination": true,
+		"route_exclude_address":      excludeAddrs,
+	}
+	if len(routeAddrs) > 0 {
+		tunInbound["route_address"] = routeAddrs
 	}
 
 	// Log level
@@ -175,12 +201,19 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 		"dns": map[string]interface{}{
 			"servers": []map[string]interface{}{
 				{"tag": "dns-remote", "address": "tcp://1.1.1.1", "detour": "proxy"},
-				{"tag": "dns-direct", "address": systemDNS, "detour": "direct"},
+				{"tag": "dns-direct", "address": cfg.DirectDNS, "detour": "direct"},
+				{"tag": "dns-fake", "address": "fakeip"},
+				{"tag": "dns-empty", "address": "rcode://success"},
 			},
 			"rules":             dnsRules,
 			"final":             "dns-direct",
 			"strategy":          "prefer_ipv4",
 			"independent_cache": true,
+			"reverse_mapping":   true,
+			"fakeip": map[string]interface{}{
+				"enabled":     true,
+				"inet4_range": cfg.FakeIPRange,
+			},
 		},
 		"inbounds":  []map[string]interface{}{tunInbound},
 		"outbounds": outbounds,
@@ -200,28 +233,53 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 	return result
 }
 
-func detectSystemDNS() string {
+func detectSystemDNSList() []string {
 	f, err := os.Open("/etc/resolv.conf")
 	if err != nil {
-		return "223.5.5.5"
+		return nil
 	}
 	defer f.Close()
 	s := bufio.NewScanner(f)
+	seen := map[string]bool{}
+	var result []string
 	for s.Scan() {
 		line := strings.TrimSpace(s.Text())
 		if strings.HasPrefix(line, "nameserver") {
 			fields := strings.Fields(line)
 			if len(fields) >= 2 && net.ParseIP(fields[1]) != nil && !strings.Contains(fields[1], ":") {
-				return fields[1]
+				if !seen[fields[1]] {
+					seen[fields[1]] = true
+					result = append(result, fields[1])
+				}
 			}
 		}
 	}
-	return "223.5.5.5"
+	return result
 }
 
-func formatUpstreamAddr(cfg *Config) string {
-	if cfg.HasUpstream() {
-		return fmt.Sprintf("%s://%s:%d", cfg.Upstream.Type, cfg.Upstream.Host, cfg.Upstream.Port)
+func cidrHostAddrs(addrs []string) []string {
+	var result []string
+	for _, addr := range addrs {
+		ip := net.ParseIP(addr)
+		if ip == nil || ip.To4() == nil || addr == "127.0.0.1" {
+			continue
+		}
+		result = append(result, ip.String()+"/32")
 	}
-	return ""
+	return result
+}
+
+func mergeRouteAddresses(groups ...[]string) []string {
+	seen := map[string]bool{}
+	var result []string
+	for _, group := range groups {
+		for _, addr := range group {
+			if addr == "" || seen[addr] {
+				continue
+			}
+			seen[addr] = true
+			result = append(result, addr)
+		}
+	}
+	return result
 }

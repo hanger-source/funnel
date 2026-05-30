@@ -1,6 +1,11 @@
 build/AntigravityProxy.app/Contents/MacOS/
 build/AntigravityProxy.app/Contents/Resources/antigravity-proxy-helper
 build/AntigravityProxy.app/Contents/Resources/com.antigravity-proxy.helper.plist
+build/Funnel.app/Contents/MacOS/
+build/Funnel.app/Contents/Resources/
 helper/antigravity-proxy-helper
+helper/funnel-helper
 antigravity-proxy-mac
+funnel
+.trash/
 .DS_Store

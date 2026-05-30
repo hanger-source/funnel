@@ -1,17 +1,24 @@
 # Funnel
 
-macOS 菜单栏工具，通过 TUN + 进程/域名路由规则，**只代理指定 App 的流量**，其余流量直连。
+macOS 菜单栏工具，通过 TUN + DNS hijack + FakeIP + 路由规则，**让指定域名和目标 App 稳定走本地上游代理**，其余流量默认直连。
 
 ## 原理
 
 ```
-所有流量 → TUN 虚拟网卡 → sing-box 路由判断
-  ├── process_name 匹配（Codex/Antigravity/...）→ 走代理
-  ├── domain_suffix 匹配（openai.com/...）→ 走代理
-  └── 其余所有进程 → 直连（不受影响）
+系统 DNS 查询 → Funnel TUN → sing-box hijack-dns
+  ├── target_domains 的 A → 返回 FakeIP（198.18.0.0/15）
+  ├── target_domains 的 AAAA → 返回空成功响应
+  └── 其他域名 → direct DNS
+
+App 连接 FakeIP → Funnel TUN → sing-box 找回原始域名
+  ├── domain_suffix 匹配（openai.com/chatgpt.com/...）→ 上游代理
+  ├── process_name 匹配（Codex/Antigravity/...）→ 上游代理
+  └── 其余流量 → 直连
 ```
 
 与全局 TUN 代理的区别：`route.final = "direct"`，只有匹配的进程或域名走代理。
+
+详细背景、DNS/FakeIP 设计和排查方法见 [docs/network-design.md](docs/network-design.md)。
 
 ## 典型用途
 
@@ -66,6 +73,8 @@ make install
     "oaistatic.com",
     "oaiusercontent.com"
   ],
+  "direct_dns": "223.5.5.5",
+  "fake_ip_range": "198.18.0.0/15",
   "log_level": "info"
 }
 ```
@@ -99,16 +108,22 @@ make install
 | `upstream.host` | 上游代理地址（通常 `127.0.0.1`） |
 | `upstream.port` | 上游代理端口 |
 | `target_processes` | 要代理的进程名列表 |
-| `target_domains` | 要代理的域名后缀列表（匹配任何进程） |
+| `target_domains` | 要代理的域名后缀列表；A 查询返回 FakeIP，AAAA 查询返回空成功响应 |
+| `direct_dns` | 非目标域名的直连 DNS；不要设成会被 TUN 捕获的系统 DNS |
+| `fake_ip_range` | 目标域名 A 查询返回的 FakeIP 段 |
+| `route_addresses` | 额外强制进入 TUN 的地址段；通常不需要配置 |
 | `nodes` | 直连节点列表（upstream 优先） |
 | `log_level` | sing-box 日志级别：trace/debug/info/warn/error |
 
 ### 路由优先级
 
-1. 私有 IP → 直连
+1. DNS 请求 → hijack 到 sing-box DNS
 2. `target_domains` 匹配 → 走代理（不管哪个进程）
-3. `target_processes` 匹配 → 走代理（不管访问什么域名）
-4. 其余 → 直连
+3. `target_processes` 匹配 → 走代理
+4. 私有 IP → 直连
+5. 其余 → 直连
+
+注意：`target_domains` 是稳定主路径。macOS 上 DNS 查询常由系统 resolver 代发，因此“按进程捕获任意未知域名 DNS”不能只靠当前 split TUN 方案严格保证；详见设计文档。
 
 ## 如何找到 App 的进程名
 
@@ -132,6 +147,25 @@ ps aux | grep -i "codex" | grep -v grep
 - 应用日志：`~/.funnel/funnel.log`
 - sing-box 日志：`~/.funnel/singbox.log`
 - Helper 日志：`/var/log/funnel-helper.log`
+
+## 快速排查
+
+核心判断标准见 [docs/network-design.md](docs/network-design.md#agent-排查手册)。目标域名的健康链路应该长这样：
+
+```text
+dns: exchanged A chatgpt.com. ... A 198.18.x.x
+inbound/tun[tun-in]: inbound connection to 198.18.x.x:443
+outbound/socks[proxy]: outbound connection to chatgpt.com:443
+```
+
+如果只看到 Codex 连接 `127.0.0.1:13658`，先区分它是环境变量代理还是系统 PAC：
+
+```bash
+ps eww -p <codex-pid> -o command= | rg 'ALL_PROXY|HTTPS_PROXY|HTTP_PROXY|NO_PROXY'
+scutil --proxy
+```
+
+没有 proxy env 但仍连接 `127.0.0.1:13658`，通常是 Chromium/Electron 读到了系统 PAC，不代表 Funnel 的 FakeIP 链路坏了。
 
 ## 依赖
 
