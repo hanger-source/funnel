@@ -7,6 +7,8 @@ import (
 	"os"
 	"os/exec"
 	"os/signal"
+	"path/filepath"
+	"regexp"
 	"strings"
 	"sync"
 	"syscall"
@@ -14,12 +16,16 @@ import (
 )
 
 const sockPath = "/var/run/funnel.sock"
+const resolverDir = "/etc/resolver"
+const funnelResolverPrefix = "# Managed by Funnel. Do not edit.\n"
+const localDNSPort = 53535
 
 type Request struct {
-	Action     string `json:"action"` // start, stop, status
-	ConfigPath string `json:"config_path,omitempty"`
-	BinaryPath string `json:"binary_path,omitempty"`
-	LogPath    string `json:"log_path,omitempty"`
+	Action        string   `json:"action"` // start, stop, status
+	ConfigPath    string   `json:"config_path,omitempty"`
+	BinaryPath    string   `json:"binary_path,omitempty"`
+	LogPath       string   `json:"log_path,omitempty"`
+	TargetDomains []string `json:"target_domains,omitempty"`
 }
 
 type Response struct {
@@ -96,6 +102,9 @@ func handleConn(conn net.Conn) {
 		err := startSingBox(req.BinaryPath, req.ConfigPath, req.LogPath)
 		if err != nil {
 			sendResponse(conn, false, err.Error())
+		} else if err := installResolverFiles(req.TargetDomains); err != nil {
+			stopSingBox()
+			sendResponse(conn, false, err.Error())
 		} else {
 			sendResponse(conn, true, "started")
 		}
@@ -164,6 +173,7 @@ func stopSingBox() {
 }
 
 func stopSingBoxLocked() {
+	removeResolverFiles()
 	if singboxCmd != nil && singboxCmd.Process != nil {
 		singboxCmd.Process.Signal(syscall.SIGTERM)
 		select {
@@ -177,6 +187,62 @@ func stopSingBoxLocked() {
 	}
 	// Clean up any old child left by a previous helper instance.
 	exec.Command("pkill", "-f", "sing-box.*funnel").Run()
+}
+
+var resolverDomainPattern = regexp.MustCompile(`^[a-z0-9][a-z0-9.-]*[a-z0-9]$`)
+
+func installResolverFiles(domains []string) error {
+	if len(domains) == 0 {
+		return nil
+	}
+	if err := os.MkdirAll(resolverDir, 0755); err != nil {
+		return fmt.Errorf("create resolver dir failed: %v", err)
+	}
+	seen := map[string]bool{}
+	for _, raw := range domains {
+		domain := normalizeResolverDomain(raw)
+		if domain == "" || seen[domain] {
+			continue
+		}
+		seen[domain] = true
+		content := fmt.Sprintf("%snameserver 127.0.0.1\nport %d\ndomain %s\noptions timeout:1 attempts:1\n", funnelResolverPrefix, localDNSPort, domain)
+		path := filepath.Join(resolverDir, domain)
+		if err := os.WriteFile(path, []byte(content), 0644); err != nil {
+			return fmt.Errorf("write resolver %s failed: %v", domain, err)
+		}
+	}
+	return nil
+}
+
+func removeResolverFiles() {
+	entries, err := os.ReadDir(resolverDir)
+	if err != nil {
+		return
+	}
+	for _, entry := range entries {
+		if entry.IsDir() {
+			continue
+		}
+		path := filepath.Join(resolverDir, entry.Name())
+		data, err := os.ReadFile(path)
+		if err != nil {
+			continue
+		}
+		if strings.HasPrefix(string(data), funnelResolverPrefix) {
+			os.Remove(path)
+		}
+	}
+}
+
+func normalizeResolverDomain(raw string) string {
+	domain := strings.Trim(strings.ToLower(raw), ". ")
+	if domain == "" || strings.Contains(domain, "/") || strings.Contains(domain, "\\") {
+		return ""
+	}
+	if !resolverDomainPattern.MatchString(domain) {
+		return ""
+	}
+	return domain
 }
 
 func sendResponse(conn net.Conn, ok bool, msg string) {

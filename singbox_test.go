@@ -46,8 +46,11 @@ func TestGenerateSingboxConfigUsesFakeIPDNSHijack(t *testing.T) {
 
 	route := generated["route"].(map[string]interface{})
 	routeRules := route["rules"].([]map[string]interface{})
-	if routeRules[0]["protocol"] != "dns" || routeRules[0]["action"] != "hijack-dns" {
-		t.Fatalf("first route rule = %#v, want DNS hijack", routeRules[0])
+	if !containsString(routeRules[0]["inbound"].([]string), "dns-in") || routeRules[0]["action"] != "hijack-dns" {
+		t.Fatalf("first route rule = %#v, want local DNS inbound hijack", routeRules[0])
+	}
+	if routeRules[1]["protocol"] != "dns" || routeRules[1]["action"] != "hijack-dns" {
+		t.Fatalf("second route rule = %#v, want TUN DNS hijack fallback", routeRules[1])
 	}
 	for _, rule := range routeRules {
 		if rule["action"] == "reject" {
@@ -57,9 +60,24 @@ func TestGenerateSingboxConfigUsesFakeIPDNSHijack(t *testing.T) {
 
 	inbounds := generated["inbounds"].([]map[string]interface{})
 	tun := inbounds[0]
+	dnsIn := inbounds[1]
+	if dnsIn["tag"] != "dns-in" || dnsIn["listen"] != "127.0.0.1" || dnsIn["listen_port"] != LocalDNSPort {
+		t.Fatalf("dns inbound = %#v, want local DNS inbound on 127.0.0.1:%d", dnsIn, LocalDNSPort)
+	}
+	routeExcludeAddresses := tun["route_exclude_address"].([]string)
+	// sing-box's own direct DNS server must stay outside the TUN.
+	if !containsString(routeExcludeAddresses, DefaultDirectDNS+"/32") {
+		t.Fatalf("route_exclude_address = %v, want direct DNS excluded", routeExcludeAddresses)
+	}
 	routeAddresses := tun["route_address"].([]string)
 	if !containsString(routeAddresses, DefaultFakeIPRange) {
 		t.Fatalf("route_address = %v, want fake IP range", routeAddresses)
+	}
+	// On many home or office networks the system DNS IP is also the default
+	// gateway. Routing that /32 into the TUN breaks ordinary direct traffic
+	// because en0 traffic still uses the captured gateway as its next hop.
+	if containsString(routeAddresses, "192.168.31.1/32") {
+		t.Fatalf("route_address must not capture system DNS/default gateway: %v", routeAddresses)
 	}
 	if containsString(routeAddresses, "59.82.0.0/16") {
 		t.Fatalf("route_address must not include broad controlled ranges: %v", routeAddresses)

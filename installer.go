@@ -158,19 +158,26 @@ func installHelperIfNeeded() error {
 		return fmt.Errorf("authorization failed (code %d)", result)
 	}
 
-	// Wait for helper socket
+	// Wait until the helper is actually connectable. The socket file appears
+	// before the helper fixes its group/mode, so os.Stat alone can race into
+	// "connect: permission denied" from the app.
 	for i := 0; i < 50; i++ {
-		if _, err := os.Stat(helperSockPath); err == nil {
+		if isHelperReachable() {
 			logInfo("helper installed successfully, socket ready")
 			return nil
 		}
 		time.Sleep(200 * time.Millisecond)
 	}
 
-	return fmt.Errorf("helper failed to start: socket not created after 10s")
+	return fmt.Errorf("helper failed to start: socket not reachable after 10s")
 }
 
 func getAppResourcesDir() string {
 	exePath, _ := os.Executable()
 	return filepath.Join(filepath.Dir(exePath), "..", "Resources")
+}
+
+func isHelperReachable() bool {
+	resp, err := sendHelperCommand(HelperRequest{Action: "status"})
+	return err == nil && resp != nil && resp.OK
 }

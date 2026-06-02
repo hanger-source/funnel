@@ -93,6 +93,7 @@ var DefaultRouteAddresses []string
 const (
 	DefaultDirectDNS   = "223.5.5.5"
 	DefaultFakeIPRange = "198.18.0.0/15"
+	LocalDNSPort       = 53535
 )
 
 func ConfigDir() string {

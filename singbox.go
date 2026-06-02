@@ -120,6 +120,7 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 	logInfo("system DNS: %v", systemDNSList)
 	logInfo("direct DNS: %s", cfg.DirectDNS)
 	logInfo("fake IP range: %s", cfg.FakeIPRange)
+	logInfo("local target DNS: 127.0.0.1:%d", LocalDNSPort)
 
 	dnsRules := []map[string]interface{}{}
 	// sing-box 1.11 legacy fakeip needs an IPv6 range for AAAA fake responses.
@@ -167,9 +168,10 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 	// TUN inbound
 	var excludeAddrs []string
 	excludeAddrs = append(excludeAddrs, excludeIPs...)
+	excludeAddrs = append(excludeAddrs, cidrHostAddrs([]string{cfg.DirectDNS})...)
 	logInfo("route_exclude_address: %v", excludeAddrs)
 
-	routeAddrs := mergeRouteAddresses(cfg.GetRouteAddresses(), []string{cfg.FakeIPRange}, cidrHostAddrs(systemDNSList))
+	routeAddrs := mergeRouteAddresses(cfg.GetRouteAddresses(), []string{cfg.FakeIPRange})
 	logInfo("route_address: %v", routeAddrs)
 
 	tunInbound := map[string]interface{}{
@@ -186,6 +188,20 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 	if len(routeAddrs) > 0 {
 		tunInbound["route_address"] = routeAddrs
 	}
+
+	dnsInbound := map[string]interface{}{
+		"type":             "direct",
+		"tag":              "dns-in",
+		"listen":           "127.0.0.1",
+		"listen_port":      LocalDNSPort,
+		"network":          "udp",
+		"override_address": "8.8.8.8",
+		"override_port":    53,
+	}
+
+	routeRules = append([]map[string]interface{}{
+		{"inbound": []string{"dns-in"}, "action": "hijack-dns"},
+	}, routeRules...)
 
 	// Log level
 	logLevel := cfg.LogLevel
@@ -215,7 +231,7 @@ func GenerateSingboxConfig(cfg *Config) map[string]interface{} {
 				"inet4_range": cfg.FakeIPRange,
 			},
 		},
-		"inbounds":  []map[string]interface{}{tunInbound},
+		"inbounds":  []map[string]interface{}{tunInbound, dnsInbound},
 		"outbounds": outbounds,
 		"route": map[string]interface{}{
 			"auto_detect_interface": true,

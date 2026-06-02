@@ -14,10 +14,11 @@ import (
 const helperSockPath = "/var/run/funnel.sock"
 
 type HelperRequest struct {
-	Action     string `json:"action"`
-	ConfigPath string `json:"config_path,omitempty"`
-	BinaryPath string `json:"binary_path,omitempty"`
-	LogPath    string `json:"log_path,omitempty"`
+	Action        string   `json:"action"`
+	ConfigPath    string   `json:"config_path,omitempty"`
+	BinaryPath    string   `json:"binary_path,omitempty"`
+	LogPath       string   `json:"log_path,omitempty"`
+	TargetDomains []string `json:"target_domains,omitempty"`
 }
 
 type HelperResponse struct {
@@ -96,10 +97,11 @@ func (a *App) Connect() error {
 
 	// Send start command to helper
 	resp, err := sendHelperCommand(HelperRequest{
-		Action:     "start",
-		BinaryPath: binary,
-		ConfigPath: configPath,
-		LogPath:    logPath,
+		Action:        "start",
+		BinaryPath:    binary,
+		ConfigPath:    configPath,
+		LogPath:       logPath,
+		TargetDomains: a.Cfg.GetTargetDomains(),
 	})
 	if err != nil {
 		logError("helper communication failed: %v", err)
@@ -183,6 +185,23 @@ func (a *App) verifyConnectivity() error {
 
 func sendHelperCommand(req HelperRequest) (*HelperResponse, error) {
 	logInfo("sending helper command: action=%s", req.Action)
+	var lastErr error
+	deadline := time.Now().Add(2 * time.Second)
+	for {
+		resp, err := sendHelperCommandOnce(req)
+		if err == nil {
+			return resp, nil
+		}
+		lastErr = err
+		if time.Now().After(deadline) {
+			break
+		}
+		time.Sleep(100 * time.Millisecond)
+	}
+	return nil, lastErr
+}
+
+func sendHelperCommandOnce(req HelperRequest) (*HelperResponse, error) {
 	conn, err := net.DialTimeout("unix", helperSockPath, 3*time.Second)
 	if err != nil {
 		return nil, fmt.Errorf("cannot connect to helper: %w", err)

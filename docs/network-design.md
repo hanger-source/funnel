@@ -106,29 +106,30 @@ outbound/socks -> target.example.com:443
 
 实验里能看到大量非目标域名或非目标进程被大网段 route 抓进来，随后 direct 超时。这就是后来移除大网段兜底的原因。
 
-## 稳定方案：DNS hijack + FakeIP
+## 稳定方案：本地域名 DNS 入口 + DNS hijack + FakeIP
 
-最终方案不再追受控 IP，而是让目标域名在 DNS 阶段就不落到受控地址。
+当前方案不再追受控 IP，而是让目标域名在 DNS 阶段就不落到受控地址。2026-06-03 的 `0160` 和 `0170` 实验已经验证：脚本安装更新后的 helper 后，macOS/libc resolver 会把目标域名解析为 FakeIP，连接会进入 TUN 并走 proxy。
 
 主链路：
 
 ```text
-1. 系统 DNS 查询进入 Funnel TUN
-2. sing-box 对 DNS packet 执行 hijack-dns
-3. target_domains 的 A 查询返回 FakeIP，AAAA 查询返回空成功响应
-4. App 连接 FakeIP
-5. FakeIP 段进入 Funnel TUN
-6. sing-box 用 FakeIP 映射找回原始域名
-7. route rule 命中 target domain/process
-8. proxy outbound 转给本地上游代理
+1. helper 为 target_domains 写入 macOS /etc/resolver/<domain>
+2. macOS 只把目标域名 DNS 查询送到 127.0.0.1:53535
+3. sing-box 本地 DNS inbound 接住查询并执行 hijack-dns
+4. target_domains 的 A 查询返回 FakeIP，AAAA 查询返回空成功响应
+5. App 连接 FakeIP
+6. FakeIP 段进入 Funnel TUN
+7. sing-box 用 FakeIP 映射找回原始域名
+8. route rule 命中 target domain/process
+9. proxy outbound 转给本地上游代理
 ```
 
 更具体地说：
 
 ```text
 App asks target.example.com A
-  -> packet to system-dns:53
-  -> route_address 捕获 system-dns/32
+  -> macOS domain-scoped resolver chooses 127.0.0.1:53535
+  -> sing-box direct inbound[dns-in]
   -> sing-box hijack-dns
   -> dns-fake returns 198.18.x.x
 
@@ -139,7 +140,9 @@ App connects 198.18.x.x:443
   -> local upstream proxy resolves/connects from proxy side
 ```
 
-这样目标域名不再依赖系统 DNS 返回的真实或受控 IP。系统 DNS 只是一个被捕获的入口，最终响应由 sing-box DNS 模块决定。
+目标域名不再依赖系统 DNS 返回的真实或受控 IP。系统 DNS/default gateway 不再被写入 `route_address`，普通流量仍走系统网络路径。
+
+注意：早期实验曾把系统 DNS `/32` 放进 TUN 来获得 DNS hijack 入口。2026-06-03 的实验推翻了这个方案：在当前网络里 `192.168.31.1` 同时是系统 DNS 和默认网关，捕获它会破坏所有依赖该网关的直连流量。当前入口是本地 DNS inbound + macOS domain-scoped resolver。
 
 ## 当前配置结构
 
@@ -248,7 +251,16 @@ Funnel 生成 sing-box 配置的位置：
 
 ### Route rules
 
-第一条 route rule 必须是 DNS hijack：
+第一条 route rule 必须是本地 DNS inbound hijack：
+
+```json
+{
+  "inbound": ["dns-in"],
+  "action": "hijack-dns"
+}
+```
+
+第二条保留 TUN DNS hijack 兜底：
 
 ```json
 {
@@ -260,14 +272,15 @@ Funnel 生成 sing-box 配置的位置：
 后续才是域名和进程代理规则：
 
 ```text
-dns packet -> hijack-dns
+dns-in -> hijack-dns
+tun dns packet -> hijack-dns
 target_domains -> proxy
 target_processes -> proxy
 private IP -> direct
 final -> direct
 ```
 
-如果 DNS hijack 不在第一条，DNS packet 可能被其他规则提前处理，目标域名就可能继续走系统 DNS。
+如果本地 DNS inbound 不先 hijack，目标域名就可能继续走系统 DNS。
 
 ### TUN route_address
 
@@ -275,17 +288,16 @@ final -> direct
 
 ```json
 [
-  "198.18.0.0/15",
-  "system-dns-1/32",
-  "system-dns-2/32"
+  "198.18.0.0/15"
 ]
 ```
 
-这三个东西各自负责不同阶段：
+各部分职责：
 
-- `system-dns/32`: 把系统 DNS 查询抓进 Funnel。
 - `198.18.0.0/15`: 把 FakeIP 连接抓进 Funnel。
 - 额外 `route_addresses`: 留给用户手动加特殊路由，但默认不依赖它。
+
+不要把系统 DNS 或默认网关地址写进默认 `route_address`。如果系统 DNS 同时是默认网关，捕获它会让普通直连流量的下一跳失效，即使目标地址本身被 `route_exclude_address` 排除也不够。
 
 不要再把受控地址的大网段写进默认配置。那是实验手段，不是产品设计。
 
@@ -359,7 +371,7 @@ connection: open outbound connection: i/o timeout
 
 结论：这不是稳定方案。
 
-### 实验 3：FakeIP + hijack-dns 跑通
+### 实验 3：捕获系统 DNS /32 能 FakeIP，但会破坏非目标 DNS
 
 实验配置要点：
 
@@ -395,8 +407,55 @@ dig +short target.example.com A
 # 198.18.x.x
 
 dig +short www.baidu.com A
+# 超时或大量失败
+```
+
+结论：这条路径证明了 FakeIP 机制本身可用，但不是稳定产品方案。当前网络里 system-dns 是默认网关，捕获它会破坏普通流量。
+
+### 实验 4：本地 DNS inbound 跑通目标 FakeIP
+
+新实验配置要点：
+
+```json
+{
+  "inbounds": [
+    {
+      "type": "tun",
+      "route_address": ["198.18.0.0/15"]
+    },
+    {
+      "type": "direct",
+      "tag": "dns-in",
+      "listen": "127.0.0.1",
+      "listen_port": 53535,
+      "network": "udp",
+      "override_address": "8.8.8.8",
+      "override_port": 53
+    }
+  ],
+  "route": {
+    "rules": [
+      { "inbound": ["dns-in"], "action": "hijack-dns" },
+      { "protocol": "dns", "action": "hijack-dns" }
+    ]
+  }
+}
+```
+
+验证结果：
+
+```bash
+dig @127.0.0.1 -p 53535 +short target.example.com A
+# 198.18.x.x
+
+dig @127.0.0.1 -p 53535 +short www.baidu.com A
+# 正常真实 IP
+
+dig +short www.baidu.com A
 # 正常真实 IP
 ```
+
+结论：本地 DNS inbound 可以作为 DNS/FakeIP 入口。产品侧通过 `/etc/resolver/<target-domain>` 把目标域名导到 `127.0.0.1:53535`。
 
 无环境变量访问目标服务：
 
@@ -416,7 +475,7 @@ inbound/tun[tun-in]: inbound connection to 198.18.x.x:443
 outbound/socks[proxy]: outbound connection to target.example.com:443
 ```
 
-结论：这是当前采用的主路径。
+结论：这是当前主路径。`0160` 验证了 macOS/libc resolver 返回 FakeIP，`0170` 验证了 FakeIP 连接进入 TUN 并由 proxy 出站。
 
 ## 排查方法
 
@@ -428,6 +487,11 @@ cat /etc/resolv.conf
 ```
 
 macOS 提醒 `/etc/resolv.conf` 不一定是所有进程的真实 resolver 配置，但 Funnel 当前用它提取系统 DNS 地址并写入 `route_address`。如果未来要更精确，应解析 `scutil --dns` 输出。
+macOS 的 `/etc/resolver/<domain>` 文件是当前目标域名 DNS 入口。Funnel 运行时应能看到 target_domains 对应 resolver：
+
+```bash
+scutil --dns | rg -A8 'openai.com|chatgpt.com|oaistatic.com|oaiusercontent.com'
+```
 
 ### 2. 看路由
 
@@ -439,7 +503,7 @@ route -n get 198.18.0.3
 Funnel 运行后应看到：
 
 ```text
-system-dns -> Funnel utun
+system-dns -> en0 或系统原路径
 198.18.0.0/15 -> Funnel utun
 ```
 
@@ -449,6 +513,7 @@ system-dns -> Funnel utun
 dig +short target.example.com A
 dig +short target.example.com AAAA
 dig +short www.baidu.com A
+dig @127.0.0.1 -p 53535 +short target.example.com A
 ```
 
 目标域名的 A 应该返回 FakeIP，AAAA 应该返回空成功响应。非目标域名应该返回真实 IP。
