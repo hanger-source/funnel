@@ -78,7 +78,7 @@ var DefaultTargetProcesses = []string{
 	"Codex Helper (Plugin)",
 }
 
-// DefaultTargetDomains — OpenAI auth & API domains
+// DefaultTargetDomains — OpenAI auth & API + Google/Antigravity IDE domains
 var DefaultTargetDomains = []string{
 	"openai.com",
 	"auth.openai.com",
@@ -86,6 +86,13 @@ var DefaultTargetDomains = []string{
 	"chatgpt.com",
 	"oaistatic.com",
 	"oaiusercontent.com",
+	// Google / Antigravity IDE
+	"google.com",
+	"googleapis.com",
+	"googlevideo.com",
+	"goog",
+	"gstatic.com",
+	"run.app",
 }
 
 var DefaultRouteAddresses []string
